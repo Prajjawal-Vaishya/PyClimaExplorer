@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import streamlit as st
+import tempfile
 
 # Gemini SDK — graceful import so the app never crashes if missing
 try:
@@ -403,6 +404,7 @@ def get_spatial_dataframe(
     variable: str,
     target_year: int,
     downsample: int = 3,
+    use_uploaded_data: bool = False,
 ) -> pd.DataFrame:
     """
     ⚡ Pillar 2 — Public API for the UI
@@ -420,6 +422,9 @@ def get_spatial_dataframe(
         Year from the slider.
     downsample : int
         Take every Nth row from the land-only grid. Default 3.
+    use_uploaded_data : bool
+        If True, attempts to pull data from st.session_state["uploaded_nc_df"]
+        instead of generating synthetic data.
 
     Returns
     -------
@@ -427,13 +432,27 @@ def get_spatial_dataframe(
         Columns: ['lat', 'lon', 'value', 'weight'] — land-only, PyDeck-ready.
     """
     try:
-        # ---- Pull the full extrapolated grid (cached) ----
-        full_df = extrapolate_anomaly(variable, target_year)
+        if use_uploaded_data and "uploaded_nc_df" in st.session_state:
+            # For user-uploaded real NetCDF files
+            full_df = st.session_state["uploaded_nc_df"].copy()
+            # If the dataset has a time dimension, filter by target_year 
+            # (assuming basic preprocessing was done on upload)
+            if "year" in full_df.columns:
+                # Find closest year
+                closest_year = full_df["year"].iloc[(full_df["year"] - target_year).abs().argsort()[:1]].values[0]
+                full_df = full_df[full_df["year"] == closest_year].copy()
+                
+            # Filter NaNs (e.g., ocean points in the real data)
+            full_df = full_df.dropna(subset=["value"])
+            
+        else:
+            # ---- Pull the full extrapolated grid (cached synthetic) ----
+            full_df = extrapolate_anomaly(variable, target_year)
 
-        # ---- Apply land mask (filter out ocean points) ----
-        land_mask = _generate_land_mask()                  # shape (180, 360)
-        land_flat = land_mask.ravel()                      # shape (64800,)
-        full_df = full_df[land_flat].reset_index(drop=True)
+            # ---- Apply land mask (filter out ocean points) ----
+            land_mask = _generate_land_mask()                  # shape (180, 360)
+            land_flat = land_mask.ravel()                      # shape (64800,)
+            full_df = full_df[land_flat].reset_index(drop=True)
 
         # ---- Downsample for WebXR performance ----
         if downsample > 1:
@@ -461,6 +480,79 @@ def get_spatial_dataframe(
             "weight": np.random.random(n).astype(np.float32) * 100,
         })
 
+
+# ============================================================
+# 📁  PILLAR 1.5 — NETCDF FILE UPLOADER
+# ============================================================
+
+def process_uploaded_nc(uploaded_file) -> bool:
+    """
+    Parse a user-uploaded NetCDF (.nc) file and convert it into a flat
+    pandas DataFrame stored in st.session_state for rendering.
+    
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # Save uploaded bytes to a temporary file since xarray needs a filepath
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".nc") as tmp:
+            tmp.write(uploaded_file.getvalue())
+            tmp_path = tmp.name
+
+        # Try to open with xarray
+        ds = xr.open_dataset(tmp_path)
+        
+        # Heuristic to find the main data variable (skip coords, bounds, etc.)
+        data_vars = [v for v in ds.data_vars if len(ds[v].dims) >= 2]
+        if not data_vars:
+            st.error("Uploaded NetCDF has no suitable 2D/3D data variables.")
+            return False
+            
+        main_var = data_vars[0]  # Just take the first one (e.g., 'tas', 'pr')
+        
+        # Convert to a flat DataFrame
+        df = ds[main_var].to_dataframe().reset_index()
+        
+        # Rename standard coordinate columns if needed
+        # NetCDFs usually use 'lat'/'latitude' and 'lon'/'longitude'
+        col_mapping = {}
+        for col in df.columns:
+            c_low = str(col).lower()
+            if c_low in ['lat', 'latitude']:
+                col_mapping[col] = 'lat'
+            elif c_low in ['lon', 'longitude']:
+                col_mapping[col] = 'lon'
+            elif c_low in ['time', 'year']:
+                col_mapping[col] = 'year'
+                
+        df = df.rename(columns=col_mapping)
+        
+        # If there's a datetime 'year' column, extract just the integer year
+        if 'year' in df.columns and pd.api.types.is_datetime64_any_dtype(df['year']):
+            df['year'] = df['year'].dt.year
+            
+        # Ensure we have lat/lon
+        if 'lat' not in df.columns or 'lon' not in df.columns:
+            st.error("NetCDF must contain 'latitude' and 'longitude' dimensions.")
+            return False
+
+        # Rename the main data column to 'value'
+        df = df.rename(columns={main_var: 'value'})
+        
+        # Clean up missing data (land masks in real NetCDFs are usually NaNs over oceans)
+        df = df.dropna(subset=['value']).copy()
+
+        # Save to session state
+        st.session_state["uploaded_nc_df"] = df
+        st.session_state["uploaded_nc_var_name"] = main_var
+        
+        # Clean up temp file
+        os.remove(tmp_path)
+        return True
+
+    except Exception as e:
+        st.error(f"Failed to parse NetCDF: {e}")
+        return False
+        
 
 # ============================================================
 # 🧠  PILLAR 3 — THE "MIC DROP" AI STORY API (GEMINI LLM)
