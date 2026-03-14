@@ -470,7 +470,7 @@ def get_spatial_dataframe(
         return df
 
     except Exception as e:
-        st.warning(f"⚠ Spatial pipeline error: {e}. Using fallback.")
+        st.warning(f"[ WARN ] Spatial pipeline error: {e}. Using fallback.")
         np.random.seed(target_year)
         n = 1200
         return pd.DataFrame({
@@ -624,7 +624,7 @@ def get_gemini_model():
 
     except Exception as e:
         # Silent fail — the UI will use its fallback narration
-        st.warning(f"⚠ Gemini init error: {e}")
+        st.warning(f"[ WARN ] Gemini init error: {e}")
         return None
 
 
@@ -699,7 +699,7 @@ def _fallback_warning(
     severity = "CRITICAL" if abs(max_anomaly) > 0.8 else "ELEVATED" if abs(max_anomaly) > 0.3 else "NOMINAL"
 
     return (
-        f"⚠ SYSTEM WARNING [{severity}] — {region_name}, YEAR {target_year}: "
+        f"SYSTEM WARNING [{severity}] — {region_name}, YEAR {target_year}: "
         f"Detected anomaly of {max_anomaly:+.3f}°C exceeds cascading-failure "
         f"threshold. Probability of irreversible tipping-point activation: "
         f"{min(99, int(abs(max_anomaly) * 60))}%. "
@@ -752,7 +752,7 @@ def stream_climate_warning(
 # 📊  UTILITY — Summary Statistics for Metric Cards
 # ============================================================
 @st.cache_data(show_spinner=False)
-def compute_summary_stats(variable: str, target_year: int) -> dict:
+def compute_summary_stats(variable: str, target_year: int, use_uploaded_data: bool = False) -> dict:
     """
     Compute summary statistics from the spatial data for the metric
     cards displayed in the top row of the dashboard.
@@ -761,8 +761,16 @@ def compute_summary_stats(variable: str, target_year: int) -> dict:
     std_value, anomaly_rate — all rounded for display.
     """
     try:
-        df = extrapolate_anomaly(variable, target_year)
-        values = df["value"]
+        if use_uploaded_data and "uploaded_nc_df" in st.session_state:
+            full_df = st.session_state["uploaded_nc_df"].copy()
+            if "year" in full_df.columns:
+                closest_year = full_df["year"].iloc[(full_df["year"] - target_year).abs().argsort()[:1]].values[0]
+                full_df = full_df[full_df["year"] == closest_year]
+            values = full_df["value"].dropna()
+        else:
+            df = extrapolate_anomaly(variable, target_year)
+            values = df["value"]
+            
         return {
             "max_value": round(float(values.max()), 2),
             "min_value": round(float(values.min()), 2),
