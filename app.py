@@ -4,6 +4,7 @@ import pandas as pd
 import pydeck as pdk
 import plotly.graph_objects as go
 import time
+import backend  # ← PyClimaExplorer backend engine (3 pillars)
 
 # ==========================================
 # PAGE CONFIG
@@ -531,28 +532,45 @@ def metric_card(label, value, delta, color_override=None, delta_color=None):
     </div>
     """
 
-# Dynamic metric values based on selected variable
+# Dynamic metric values driven by backend.compute_summary_stats()
+stats = backend.compute_summary_stats(climate_var, selected_year)
+stats_prev = backend.compute_summary_stats(climate_var, max(selected_year - 10, 1980))  # decade comparison
+delta_max = round(stats["max_value"] - stats_prev["max_value"], 2)
+delta_sign = "▲" if delta_max >= 0 else "▼"
+
+unit_map = {"Temperature anomaly": "°C", "Precipitation levels": "mm", "Wind velocity patterns": "m/s"}
+unit = unit_map.get(climate_var, "")
+
 if is_temp:
     with col1:
-        st.markdown(metric_card("Global Max Temp", "+1.24°C", "▲ +0.08 vs. prev. decade", "#ff3333", "#ff6b6b"), unsafe_allow_html=True)
+        st.markdown(metric_card("Global Max Anomaly", f"{stats['max_value']:+.2f}{unit}",
+            f"{delta_sign} {delta_max:+.2f} vs. decade ago", "#ff3333", "#ff6b6b"), unsafe_allow_html=True)
     with col2:
-        st.markdown(metric_card("Anomaly Rate", "14.8%", "▲ Critical threshold", "#ffaa00", "#ffd060"), unsafe_allow_html=True)
+        st.markdown(metric_card("Anomaly Rate", f"{stats['anomaly_rate']:.1f}%",
+            "▲ Critical" if stats['anomaly_rate'] > 30 else "Nominal", "#ffaa00", "#ffd060"), unsafe_allow_html=True)
     with col3:
-        st.markdown(metric_card("Sea Level Δ", "+3.4mm/yr", "Accelerating since 2012"), unsafe_allow_html=True)
+        st.markdown(metric_card("Mean Anomaly", f"{stats['mean_value']:+.2f}{unit}",
+            f"σ = {stats['std_value']:.2f}"), unsafe_allow_html=True)
 elif is_precip:
     with col1:
-        st.markdown(metric_card("Max Precipitation", "312mm", "▲ +18mm vs. avg", "#1e90ff", "#5eb3ff"), unsafe_allow_html=True)
+        st.markdown(metric_card("Max Precipitation", f"{stats['max_value']:.1f}{unit}",
+            f"{delta_sign} {abs(delta_max):.1f}mm vs. decade ago", "#1e90ff", "#5eb3ff"), unsafe_allow_html=True)
     with col2:
-        st.markdown(metric_card("Drought Index", "2.4", "Moderate — watch zone", "#ffaa00", "#ffd060"), unsafe_allow_html=True)
+        st.markdown(metric_card("Anomaly Rate", f"{stats['anomaly_rate']:.1f}%",
+            "Moderate — watch zone" if stats['anomaly_rate'] > 20 else "Stable", "#ffaa00", "#ffd060"), unsafe_allow_html=True)
     with col3:
-        st.markdown(metric_card("Flood Events", "47", "▲ +12 this decade"), unsafe_allow_html=True)
+        st.markdown(metric_card("Mean Precip", f"{stats['mean_value']:.1f}{unit}",
+            f"σ = {stats['std_value']:.1f}"), unsafe_allow_html=True)
 else:
     with col1:
-        st.markdown(metric_card("Peak Wind Speed", "142 km/h", "Category 3 threshold", "#dc32dc", "#e080e0"), unsafe_allow_html=True)
+        st.markdown(metric_card("Peak Wind Speed", f"{stats['max_value']:.1f} {unit}",
+            f"{delta_sign} {abs(delta_max):.1f} vs. decade ago", "#dc32dc", "#e080e0"), unsafe_allow_html=True)
     with col2:
-        st.markdown(metric_card("Avg Surface Wind", "18.6 m/s", "▲ +1.2 vs. baseline", "#00f3ff", "#80f9ff"), unsafe_allow_html=True)
+        st.markdown(metric_card("Avg Surface Wind", f"{stats['mean_value']:.1f} {unit}",
+            f"{delta_sign} {abs(delta_max):.1f} vs. baseline", "#00f3ff", "#80f9ff"), unsafe_allow_html=True)
     with col3:
-        st.markdown(metric_card("Storm Frequency", "23/yr", "▲ Rising trend"), unsafe_allow_html=True)
+        st.markdown(metric_card("Anomaly Rate", f"{stats['anomaly_rate']:.1f}%",
+            "▲ Rising trend" if stats['anomaly_rate'] > 25 else "Stable"), unsafe_allow_html=True)
 
 
 st.markdown("<br>", unsafe_allow_html=True)
@@ -570,22 +588,16 @@ for color, label in legend_items:
 legend_html += "</div>"
 st.markdown(legend_html, unsafe_allow_html=True)
 
-# Dummy spatial data seeded by year for reactivity
-np.random.seed(selected_year)
-n_points = 1200
-df_spatial = pd.DataFrame({
-    'lat': np.random.uniform(-60, 60, n_points),
-    'lon': np.random.uniform(-180, 180, n_points),
-    'weight': np.random.random(n_points) * 100
-})
+# ⚙️  Pillar 1+2: Smart Math pipeline → cached spatial DataFrame
+df_spatial = backend.get_spatial_dataframe(climate_var, selected_year)
 
 layer = pdk.Layer(
     "HexagonLayer",
     data=df_spatial,
     get_position=["lon", "lat"],
-    radius=200000,
-    elevation_scale=50000,
-    elevation_range=[0, 3000],
+    radius=120000,
+    elevation_scale=1000,         # ← was 50000 — subtle raised bumps, not skyscrapers
+    elevation_range=[0, 800],     # ← was [0, 3000] — keep pillars compact
     extruded=True,
     pickable=True,
     color_range=map_colors,
@@ -593,7 +605,9 @@ layer = pdk.Layer(
 
 view_state = pdk.ViewState(
     latitude=20, longitude=0,
-    zoom=1.2, pitch=50, bearing=-10
+    zoom=1.2, pitch=45, bearing=-10,
+    # Lock the viewport to prevent weird scrolling artifacts
+    min_zoom=0.5, max_zoom=3.5 
 )
 
 r = pdk.Deck(
@@ -601,26 +615,32 @@ r = pdk.Deck(
     map_style=pdk.map_styles.CARTO_DARK,
     layers=[layer],
     initial_view_state=view_state,
-    tooltip={"text": "Hex Bin Count: {elevationValue}"}
+    tooltip={"text": f"{climate_var} — Hex Bin Count: {{elevationValue}}"},
+    parameters={"clearColor": [0, 0, 0, 0], "depthTest": True}
 )
 
-st.pydeck_chart(r, use_container_width=True)
+st.pydeck_chart(r, use_container_width=True, height=480)  # lock map height
 
-st.markdown("<br>", unsafe_allow_html=True)
+# CSS spacer — breathing room between map and bottom row
+st.markdown("<div style='margin-bottom: 2.5rem;'></div>", unsafe_allow_html=True)
 
 
 # ==========================================
 # BOTTOM ROW: TEMPORAL CHART + AI NARRATION
 # ==========================================
-bottom_col1, bottom_col2 = st.columns([1.5, 1])
+with st.container():
+    bottom_col1, bottom_col2 = st.columns([7, 3])
 
 # --- Column 1: Plotly Temporal Time-Series ---
 with bottom_col1:
     st.markdown("<div class='section-heading'>Temporal Analysis</div>", unsafe_allow_html=True)
 
+    # Build temporal series from the backend (mean anomaly per year)
     years = np.arange(1980, 2051)
-    np.random.seed(42)
-    values = 0.02 * (years - 1980) + np.sin((years - 1980) / 3) * 0.5 + np.random.normal(0, 0.2, len(years))
+    values = np.array([
+        backend.compute_summary_stats(climate_var, int(yr))["mean_value"]
+        for yr in years
+    ])
 
     # Per-point diverging marker colors (Temperature mode)
     if is_temp:
@@ -668,7 +688,7 @@ with bottom_col1:
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         font=dict(family="Chakra Petch, sans-serif", color="#e2e8f0", size=15),
-        margin=dict(l=10, r=10, t=30, b=10),
+        margin=dict(l=0, r=0, t=30, b=0),
         xaxis=dict(
             showgrid=True, gridcolor='rgba(0, 243, 255, 0.06)',
             title=dict(text="Year", font=dict(size=18, family="Chakra Petch, sans-serif")),
@@ -676,11 +696,19 @@ with bottom_col1:
         ),
         yaxis=dict(
             showgrid=True, gridcolor='rgba(0, 243, 255, 0.06)',
-            title=dict(text="Variance (Δ)", font=dict(size=18, family="Chakra Petch, sans-serif")),
+            title=dict(text=f"Anomaly ({unit})", font=dict(size=18, family="Chakra Petch, sans-serif")),
             tickfont=dict(size=14)
         ),
         hovermode="x unified",
-        showlegend=False
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            bgcolor='rgba(0,0,0,0)'
+        )
     )
 
     st.plotly_chart(fig, use_container_width=True)
@@ -691,31 +719,29 @@ with bottom_col2:
     st.markdown("<div class='section-heading' style='text-align: center;'>AI Narration</div>", unsafe_allow_html=True)
 
     if st.button("⚡ Generate AI Climate Report"):
-        with st.spinner("Synthesizing telemetry data..."):
-            time.sleep(1.5)
+        # 🧠 Pillar 3: Gemini LLM streaming (falls back gracefully)
+        ai_stats = backend.compute_summary_stats(climate_var, selected_year)
+        max_anom = ai_stats["max_value"]
+        anomaly_rate = ai_stats["anomaly_rate"]
 
-        current_val = values[yr_idx]
-        severity = "critical" if abs(current_val) > 0.8 else "moderate" if abs(current_val) > 0.3 else "stable"
+        severity = "critical" if anomaly_rate > 40 else "moderate" if anomaly_rate > 20 else "stable"
         severity_color = "#ff3333" if severity == "critical" else "#ffaa00" if severity == "moderate" else "#00ff00"
 
-        story = f"""
-        <strong style='color: {severity_color};'>⬤ THREAT LEVEL: {severity.upper()}</strong>
-        <br><br>
-        <strong>SYSTEM LOG — YEAR {selected_year}:</strong> Analysis of
-        <span class='highlight'>{climate_var.lower()}</span> reveals a
-        {"critical inflection point" if severity == "critical" else "notable trend"}.
-        Temporal variance stands at <strong>Δ{current_val:.2f}</strong>,
-        {"triggering cascading effects across equatorial zones" if current_val > 0.5 else "within observable monitoring thresholds"}.
-        <br><br>
-        The probability of extreme weather events has
-        {"increased by 34.2%" if current_val > 0.5 else "remained within normal bounds"} relative to baseline metrics.
-        <br><br>
-        <em>Recommendation:</em>
-        {"Initiate localized predictive modeling to mitigate potential systemic disruptions." if severity == "critical"
-         else "Continue standard monitoring protocols. No immediate action required." if severity == "stable"
-         else "Increase observation frequency. Prepare contingency models for regional analysis."}
-        """
-        st.markdown(f"<div class='story-box'>{story}</div>", unsafe_allow_html=True)
+        # Severity header (HTML styled)
+        st.markdown(f"""
+        <div class='story-box'>
+            <strong style='color: {severity_color};'>⬤ THREAT LEVEL: {severity.upper()}</strong><br><br>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Stream the AI warning character-by-character (typing effect)
+        st.write_stream(
+            backend.stream_climate_warning(
+                target_year=selected_year,
+                max_anomaly=float(max_anom),
+                region_name="Global Equatorial Zone",
+            )
+        )
     else:
         st.markdown("""
         <div class='story-box' style='text-align: center; opacity: 0.7;'>
