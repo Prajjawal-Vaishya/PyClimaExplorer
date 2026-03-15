@@ -448,34 +448,36 @@ with st.sidebar:
 
     # ── Step 1: Feed Data ──
     st.markdown("<div class='step-label'>Step 1 → Feed Data</div>", unsafe_allow_html=True)
+    
+    # 1. The File Uploader Widget
     uploaded_file = st.file_uploader(
-        "Upload a NetCDF (.nc) climate dataset",
-        type=["nc"],
-        help="Drop your .nc file here. We'll auto-detect variables like Temperature, Precipitation, or Wind."
+        "Upload Custom Climate Data (.nc)", 
+        type=["nc"], 
+        help="Upload standard NetCDF climate data. If left empty, system uses default fallback data."
     )
 
-    # Process uploaded file
-    use_uploaded = False
+    # 2. Logic to handle the uploaded file
     if uploaded_file is not None:
-        if "uploaded_nc_processed" not in st.session_state or st.session_state.get("uploaded_nc_name") != uploaded_file.name:
-            with st.spinner("Parsing your dataset..."):
-                success = backend.process_uploaded_nc(uploaded_file)
-                if success:
-                    st.session_state["uploaded_nc_processed"] = True
-                    st.session_state["uploaded_nc_name"] = uploaded_file.name
-                    st.success(f"[ OK ] Loaded: **{uploaded_file.name}**")
-                else:
-                    st.session_state["uploaded_nc_processed"] = False
-
-    if st.session_state.get("uploaded_nc_processed"):
-        st.markdown(f"""
-        <div class='status-pill status-uploaded'>
-            DATASET: {st.session_state.get('uploaded_nc_name', 'Dataset')}
-        </div>
-        """, unsafe_allow_html=True)
-        use_uploaded = st.checkbox("Use uploaded dataset", value=True,
-                                   help="Toggle to switch between your uploaded data and the built-in synthetic simulation.")
-
+        # Save the uploaded file to disk so xarray can read it
+        temp_path = "custom_uploaded_data.nc"
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+        except PermissionError:
+            # Fallback: if the file is locked by a stale process, use a unique name
+            import hashlib
+            h = hashlib.md5(uploaded_file.name.encode()).hexdigest()[:8]
+            temp_path = f"custom_uploaded_data_{h}.nc"
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+        
+        st.success("✅ Custom Dataset Loaded!")
+        st.session_state["active_data_path"] = temp_path # Tell backend to use this uploaded file
+        use_uploaded = True
+    else:
+        st.session_state["active_data_path"] = "og_climate_data.nc" # Default file if nothing is uploaded
+        use_uploaded = False
+        
     st.markdown("---")
 
     # ── Step 2: Choose What to See ──
@@ -633,18 +635,23 @@ def render_metric_cards(year_val):
                 "▲ Rising" if stats['anomaly_rate'] > 25 else "Stable"), unsafe_allow_html=True)
 
 
-def render_pydeck_map(year_val, map_height=500):
+def render_pydeck_map(year_val, map_height=480):
     """Render a PyDeck 3D globe for a given year."""
     # ── BACKEND HOOK: get_spatial_dataframe ──
     df_spatial = backend.get_spatial_dataframe(climate_var, year_val, use_uploaded_data=use_uploaded)
+
+    # Guard: if parser returned empty (corrupted file), show warning and bail
+    if df_spatial.empty:
+        st.warning("⚠ No renderable data found. Check your uploaded file or revert to default.")
+        return
 
     layer = pdk.Layer(
         "HexagonLayer",
         data=df_spatial,
         get_position=["lon", "lat"],
-        radius=120000,
-        elevation_scale=1000,
-        elevation_range=[0, 800],
+        radius=50000,
+        elevation_scale=1500,
+        get_elevation_weight="weight",
         extruded=True,
         pickable=True,
         color_range=map_colors,
@@ -659,7 +666,7 @@ def render_pydeck_map(year_val, map_height=500):
         map_style=pdk.map_styles.CARTO_DARK,
         layers=[layer],
         initial_view_state=view_state,
-        tooltip={"text": f"{climate_var} — Hex Bin Count: {{elevationValue}}"},
+        tooltip={"text": f"{climate_var} — Value: {{elevationValue}}"},
         parameters={"clearColor": [0, 0, 0, 0], "depthTest": True}
     )
     st.pydeck_chart(deck, use_container_width=True, height=map_height)
@@ -774,7 +781,7 @@ with tab_main:
     """, unsafe_allow_html=True)
 
     render_legend()
-    render_pydeck_map(selected_year, map_height=520)
+    render_pydeck_map(selected_year, map_height=480)
 
     # Spacer
     st.markdown("<div style='margin-bottom: 2rem;'></div>", unsafe_allow_html=True)

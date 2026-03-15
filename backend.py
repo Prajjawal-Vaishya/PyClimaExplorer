@@ -19,7 +19,6 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import streamlit as st
-import tempfile
 
 # Gemini SDK — graceful import so the app never crashes if missing
 try:
@@ -399,6 +398,136 @@ def _generate_land_mask() -> np.ndarray:
     return mask_flat.reshape(lat_grid.shape)
 
 
+def load_climate_dataset(file_path):
+    """
+    Dynamically loads either the default .nc file OR the custom uploaded .nc file.
+    NOT cached — caching an open xr.Dataset causes Windows file locks
+    that block re-uploads. The dataset is closed immediately after
+    reading in _parse_universal_nc(), so caching is unnecessary.
+    """
+    if os.path.exists(file_path):
+        try:
+            return xr.open_dataset(file_path)
+        except Exception as e:
+            st.error(f"File reading error: Is it a valid .nc file? Details: {e}")
+            return None
+    return None
+
+
+# ============================================================
+# 🛡️  UNIVERSAL NETCDF PARSER (All 4 Edge Cases Handled)
+# ============================================================
+# Edge Case 1 (Variable Ambiguity)  → auto-detect via dim exclusion
+# Edge Case 2 (Missing Time Dim)   → graceful skip
+# Edge Case 3 (Ghost Pillars/NaN)  → aggressive dropna
+# Edge Case 4 (Longitude 0-360)    → shift to -180..180
+# ============================================================
+
+_STANDARD_DIMS = {
+    'lat', 'latitude', 'lon', 'longitude',
+    'time', 'year', 'level', 'lev', 'plev',
+    'height', 'bnds', 'nv', 'nbnd',
+}
+
+
+def _parse_universal_nc(file_path: str, target_year: int) -> pd.DataFrame:
+    """
+    Universal NetCDF → DataFrame parser.
+
+    1. Opens the dataset and auto-detects the primary climate variable
+       by excluding known coordinate/dimension names.
+    2. Normalizes lat/lon column names.
+    3. Shifts longitudes from 0–360 to -180–180 (PyDeck requirement).
+    4. If a time dimension exists, slices to the nearest requested year.
+       If no time dimension, renders all data as-is (static snapshot).
+    5. Strips all NaN rows to prevent ghost pillars in PyDeck.
+
+    Parameters
+    ----------
+    file_path : str
+        Absolute or relative path to the .nc file on disk.
+    target_year : int
+        The year requested by the UI slider.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ['lat', 'lon', 'value'] — clean, PyDeck-ready.
+        Returns empty DataFrame on any failure.
+    """
+    try:
+        ds = load_climate_dataset(file_path)
+        if ds is None:
+            return pd.DataFrame()
+
+        # ---- EDGE CASE 1: Auto-detect the primary data variable ----
+        # Exclude anything that looks like a coordinate or bound
+        data_vars = [
+            v for v in ds.data_vars
+            if v.lower() not in _STANDARD_DIMS and len(ds[v].dims) >= 2
+        ]
+        if not data_vars:
+            # Fallback: just take the first var with 2+ dims
+            data_vars = [v for v in ds.data_vars if len(ds[v].dims) >= 2]
+        if not data_vars:
+            return pd.DataFrame()
+
+        main_var = data_vars[0]
+
+        # ---- EDGE CASE 2: Temporal resilience ----
+        # If the dataset has a time dimension, slice to nearest year BEFORE
+        # converting to DataFrame (saves RAM on large files).
+        da = ds[main_var]
+
+        if 'time' in ds.dims:
+            times = pd.to_datetime(ds['time'].values)
+            target_dt = pd.Timestamp(f"{target_year}-01-01")
+            # Find the index of the closest timestamp
+            idx = (times - target_dt).map(abs).argmin()
+            da = da.isel(time=idx)
+
+        # If there are extra dims (like 'level'), take the first slice
+        for dim in da.dims:
+            if dim.lower() not in ('lat', 'latitude', 'lon', 'longitude'):
+                da = da.isel({dim: 0})
+
+        # Convert to flat DataFrame
+        full_df = da.to_dataframe(name='value').reset_index()
+
+        # Close the dataset handle to release Windows file locks
+        ds.close()
+
+        # ---- Normalize coordinate column names ----
+        col_mapping = {}
+        for col in full_df.columns:
+            c_low = str(col).lower()
+            if c_low in ('lat', 'latitude'):
+                col_mapping[col] = 'lat'
+            elif c_low in ('lon', 'longitude'):
+                col_mapping[col] = 'lon'
+        full_df = full_df.rename(columns=col_mapping)
+
+        # Ensure lat and lon exist
+        if 'lat' not in full_df.columns or 'lon' not in full_df.columns:
+            return pd.DataFrame()
+
+        # ---- EDGE CASE 4: Longitude normalization (0–360 → -180–180) ----
+        # Many climate models (CMIP, ERA5) use 0–360 longitudes.
+        # PyDeck strictly requires -180–180 or the map splits at the Pacific.
+        if full_df['lon'].max() > 180:
+            full_df.loc[full_df['lon'] > 180, 'lon'] -= 360
+
+        # ---- EDGE CASE 3: Strip NaN → prevent ghost pillars ----
+        full_df = full_df.dropna(subset=['value'])
+
+        # Return only the essential columns
+        return full_df[['lat', 'lon', 'value']].reset_index(drop=True)
+
+    except Exception as e:
+        st.warning(f"[ WARN ] Universal NC parser error: {e}")
+        return pd.DataFrame()
+
+
 @st.cache_data(show_spinner=False)
 def get_spatial_dataframe(
     variable: str,
@@ -408,48 +537,25 @@ def get_spatial_dataframe(
 ) -> pd.DataFrame:
     """
     ⚡ Pillar 2 — Public API for the UI
-    End-to-end cached pipeline: baseline → extrapolation → land-masking
-    → downsampling.
-
-    Points over open ocean are filtered out using the land mask so that
-    PyDeck hex bars align with real-world continental geography.
-
-    Parameters
-    ----------
-    variable : str
-        Climate variable name.
-    target_year : int
-        Year from the slider.
-    downsample : int
-        Take every Nth row from the land-only grid. Default 3.
-    use_uploaded_data : bool
-        If True, attempts to pull data from st.session_state["uploaded_nc_df"]
-        instead of generating synthetic data.
+    End-to-end cached pipeline:
+      Uploaded data  → universal parser → downsample → weight normalization
+      Synthetic data → extrapolation → land mask → downsample → weight normalization
 
     Returns
     -------
     pd.DataFrame
-        Columns: ['lat', 'lon', 'value', 'weight'] — land-only, PyDeck-ready.
+        Columns: ['lat', 'lon', 'value', 'weight'] — PyDeck-ready.
     """
     try:
-        if use_uploaded_data and "uploaded_nc_df" in st.session_state:
-            # For user-uploaded real NetCDF files
-            full_df = st.session_state["uploaded_nc_df"].copy()
-            # If the dataset has a time dimension, filter by target_year 
-            # (assuming basic preprocessing was done on upload)
-            if "year" in full_df.columns:
-                # Find closest year
-                closest_year = full_df["year"].iloc[(full_df["year"] - target_year).abs().argsort()[:1]].values[0]
-                full_df = full_df[full_df["year"] == closest_year].copy()
-                
-            # Filter NaNs (e.g., ocean points in the real data)
-            full_df = full_df.dropna(subset=["value"])
-            
+        if use_uploaded_data and "active_data_path" in st.session_state:
+            # ---- UPLOADED DATA: use the universal parser ----
+            file_path = st.session_state["active_data_path"]
+            full_df = _parse_universal_nc(file_path, target_year)
+            if full_df.empty:
+                return pd.DataFrame()
         else:
-            # ---- Pull the full extrapolated grid (cached synthetic) ----
+            # ---- SYNTHETIC DATA: extrapolation + land mask ----
             full_df = extrapolate_anomaly(variable, target_year)
-
-            # ---- Apply land mask (filter out ocean points) ----
             land_mask = _generate_land_mask()                  # shape (180, 360)
             land_flat = land_mask.ravel()                      # shape (64800,)
             full_df = full_df[land_flat].reset_index(drop=True)
@@ -479,79 +585,6 @@ def get_spatial_dataframe(
             "value": np.random.random(n).astype(np.float32) * 50,
             "weight": np.random.random(n).astype(np.float32) * 100,
         })
-
-
-# ============================================================
-# 📁  PILLAR 1.5 — NETCDF FILE UPLOADER
-# ============================================================
-
-def process_uploaded_nc(uploaded_file) -> bool:
-    """
-    Parse a user-uploaded NetCDF (.nc) file and convert it into a flat
-    pandas DataFrame stored in st.session_state for rendering.
-    
-    Returns True if successful, False otherwise.
-    """
-    try:
-        # Save uploaded bytes to a temporary file since xarray needs a filepath
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".nc") as tmp:
-            tmp.write(uploaded_file.getvalue())
-            tmp_path = tmp.name
-
-        # Try to open with xarray
-        ds = xr.open_dataset(tmp_path)
-        
-        # Heuristic to find the main data variable (skip coords, bounds, etc.)
-        data_vars = [v for v in ds.data_vars if len(ds[v].dims) >= 2]
-        if not data_vars:
-            st.error("Uploaded NetCDF has no suitable 2D/3D data variables.")
-            return False
-            
-        main_var = data_vars[0]  # Just take the first one (e.g., 'tas', 'pr')
-        
-        # Convert to a flat DataFrame
-        df = ds[main_var].to_dataframe().reset_index()
-        
-        # Rename standard coordinate columns if needed
-        # NetCDFs usually use 'lat'/'latitude' and 'lon'/'longitude'
-        col_mapping = {}
-        for col in df.columns:
-            c_low = str(col).lower()
-            if c_low in ['lat', 'latitude']:
-                col_mapping[col] = 'lat'
-            elif c_low in ['lon', 'longitude']:
-                col_mapping[col] = 'lon'
-            elif c_low in ['time', 'year']:
-                col_mapping[col] = 'year'
-                
-        df = df.rename(columns=col_mapping)
-        
-        # If there's a datetime 'year' column, extract just the integer year
-        if 'year' in df.columns and pd.api.types.is_datetime64_any_dtype(df['year']):
-            df['year'] = df['year'].dt.year
-            
-        # Ensure we have lat/lon
-        if 'lat' not in df.columns or 'lon' not in df.columns:
-            st.error("NetCDF must contain 'latitude' and 'longitude' dimensions.")
-            return False
-
-        # Rename the main data column to 'value'
-        df = df.rename(columns={main_var: 'value'})
-        
-        # Clean up missing data (land masks in real NetCDFs are usually NaNs over oceans)
-        df = df.dropna(subset=['value']).copy()
-
-        # Save to session state
-        st.session_state["uploaded_nc_df"] = df
-        st.session_state["uploaded_nc_var_name"] = main_var
-        
-        # Clean up temp file
-        os.remove(tmp_path)
-        return True
-
-    except Exception as e:
-        st.error(f"Failed to parse NetCDF: {e}")
-        return False
         
 
 # ============================================================
@@ -757,20 +790,24 @@ def compute_summary_stats(variable: str, target_year: int, use_uploaded_data: bo
     Compute summary statistics from the spatial data for the metric
     cards displayed in the top row of the dashboard.
 
+    Uses the centralized _parse_universal_nc for uploaded data
+    to guarantee consistent parsing with the map renderer.
+
     Returns a dict with keys: max_value, min_value, mean_value,
     std_value, anomaly_rate — all rounded for display.
     """
     try:
-        if use_uploaded_data and "uploaded_nc_df" in st.session_state:
-            full_df = st.session_state["uploaded_nc_df"].copy()
-            if "year" in full_df.columns:
-                closest_year = full_df["year"].iloc[(full_df["year"] - target_year).abs().argsort()[:1]].values[0]
-                full_df = full_df[full_df["year"] == closest_year]
-            values = full_df["value"].dropna()
+        if use_uploaded_data and "active_data_path" in st.session_state:
+            # ---- UPLOADED DATA: reuse universal parser ----
+            file_path = st.session_state["active_data_path"]
+            full_df = _parse_universal_nc(file_path, target_year)
+            if full_df.empty:
+                raise ValueError("Universal parser returned empty")
+            values = full_df["value"]
         else:
             df = extrapolate_anomaly(variable, target_year)
             values = df["value"]
-            
+
         return {
             "max_value": round(float(values.max()), 2),
             "min_value": round(float(values.min()), 2),
