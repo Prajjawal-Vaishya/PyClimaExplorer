@@ -816,15 +816,15 @@ with tab_main:
                 _dp = st.session_state.get("active_data_path", "")
                 stats = backend.compute_summary_stats(climate_var, selected_year, use_uploaded_data=use_uploaded, data_path=_dp)
                 
-                # Fetch the cinematic warning
-                ai_warning = backend.generate_ai_report(stats['max_value'], target_year=selected_year)
-                
                 # Display in a terminal-style block
-                st.markdown(f"""
-                <div style='background: rgba(255,51,51,0.1); border-left: 4px solid #ff3333; padding: 1rem; border-radius: 4px; font-family: monospace;'>
-                    <span style='color: #ff3333; font-weight: bold;'>[SYSTEM ALERT]</span> {ai_warning}
-                </div>
-                """, unsafe_allow_html=True)
+                st.markdown(f"<span style='color: #ff3333; font-weight: bold; font-family: monospace;'>[SYSTEM ALERT]</span>", unsafe_allow_html=True)
+                
+                # Container for the streaming text
+                with st.container(border=True):
+                    # Call the new Senior Dev generator function
+                    stream_obj = backend.stream_story_mode(selected_year, climate_var, stats)
+                    # st.write_stream consumes the generator and types it out
+                    st.write_stream(stream_obj)
         else:
             st.markdown("""
             <div style='background: rgba(255,255,255,0.03); border: 1px dashed rgba(255,255,255,0.2); padding: 1rem; border-radius: 4px; color: #8a99ad; font-family: monospace; text-align: center;'>
