@@ -475,16 +475,16 @@ def _parse_universal_nc(file_path: str, target_year: int) -> pd.DataFrame:
         main_var = data_vars[0]
 
         # ---- EDGE CASE 2: Temporal resilience ----
-        # If the dataset has a time dimension, slice to nearest year BEFORE
-        # converting to DataFrame (saves RAM on large files).
+        # If the dataset has a time dimension, use .sel(method='nearest')
+        # to slice to the closest timestep BEFORE converting to DataFrame
+        # (saves RAM on multi-GB files).
         da = ds[main_var]
 
         if 'time' in ds.dims:
-            times = pd.to_datetime(ds['time'].values)
+            # Build a target timestamp from the UI slider year
             target_dt = pd.Timestamp(f"{target_year}-01-01")
-            # Find the index of the closest timestamp
-            idx = (times - target_dt).map(abs).argmin()
-            da = da.isel(time=idx)
+            # xarray's native nearest-neighbor selection — the spec-required approach
+            da = da.sel(time=target_dt, method='nearest')
 
         # If there are extra dims (like 'level'), take the first slice
         for dim in da.dims:
@@ -534,6 +534,7 @@ def get_spatial_dataframe(
     target_year: int,
     downsample: int = 3,
     use_uploaded_data: bool = False,
+    data_path: str = "",
 ) -> pd.DataFrame:
     """
     ⚡ Pillar 2 — Public API for the UI
@@ -541,16 +542,20 @@ def get_spatial_dataframe(
       Uploaded data  → universal parser → downsample → weight normalization
       Synthetic data → extrapolation → land mask → downsample → weight normalization
 
+    IMPORTANT: `data_path` is passed explicitly so it becomes part of the
+    @st.cache_data key. Reading from st.session_state inside a cached
+    function is a silent caching bug — the cache never invalidates when
+    the user uploads a different file.
+
     Returns
     -------
     pd.DataFrame
         Columns: ['lat', 'lon', 'value', 'weight'] — PyDeck-ready.
     """
     try:
-        if use_uploaded_data and "active_data_path" in st.session_state:
+        if use_uploaded_data and data_path:
             # ---- UPLOADED DATA: use the universal parser ----
-            file_path = st.session_state["active_data_path"]
-            full_df = _parse_universal_nc(file_path, target_year)
+            full_df = _parse_universal_nc(data_path, target_year)
             if full_df.empty:
                 return pd.DataFrame()
         else:
@@ -720,6 +725,29 @@ def generate_climate_warning(
         return _fallback_warning(target_year, max_anomaly, region_name)
 
 
+# ---- Spec-required facade function ----
+def generate_ai_report(max_anomaly: float, target_year: int = 2030) -> str:
+    """
+    🧠 Simple public API for the UI's "Generate Report" button.
+
+    Wraps generate_climate_warning with sensible defaults so the
+    frontend only needs to pass the peak anomaly value.
+
+    Parameters
+    ----------
+    max_anomaly : float
+        The peak anomaly value computed by the spatial pipeline.
+    target_year : int
+        Year under analysis (defaults to 2030 if not provided).
+
+    Returns
+    -------
+    str
+        A dramatic 2-line climate warning (from Gemini or fallback).
+    """
+    return generate_climate_warning(target_year, max_anomaly)
+
+
 def _fallback_warning(
     target_year: int,
     max_anomaly: float,
@@ -785,7 +813,12 @@ def stream_climate_warning(
 # 📊  UTILITY — Summary Statistics for Metric Cards
 # ============================================================
 @st.cache_data(show_spinner=False)
-def compute_summary_stats(variable: str, target_year: int, use_uploaded_data: bool = False) -> dict:
+def compute_summary_stats(
+    variable: str,
+    target_year: int,
+    use_uploaded_data: bool = False,
+    data_path: str = "",
+) -> dict:
     """
     Compute summary statistics from the spatial data for the metric
     cards displayed in the top row of the dashboard.
@@ -793,14 +826,15 @@ def compute_summary_stats(variable: str, target_year: int, use_uploaded_data: bo
     Uses the centralized _parse_universal_nc for uploaded data
     to guarantee consistent parsing with the map renderer.
 
+    IMPORTANT: `data_path` is an explicit arg for cache-key correctness.
+
     Returns a dict with keys: max_value, min_value, mean_value,
     std_value, anomaly_rate — all rounded for display.
     """
     try:
-        if use_uploaded_data and "active_data_path" in st.session_state:
+        if use_uploaded_data and data_path:
             # ---- UPLOADED DATA: reuse universal parser ----
-            file_path = st.session_state["active_data_path"]
-            full_df = _parse_universal_nc(file_path, target_year)
+            full_df = _parse_universal_nc(data_path, target_year)
             if full_df.empty:
                 raise ValueError("Universal parser returned empty")
             values = full_df["value"]
@@ -821,3 +855,4 @@ def compute_summary_stats(variable: str, target_year: int, use_uploaded_data: bo
             "mean_value": 0.0, "std_value": 0.0,
             "anomaly_rate": 0.0,
         }
+

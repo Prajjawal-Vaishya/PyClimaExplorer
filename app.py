@@ -645,16 +645,31 @@ def render_pydeck_map(year_val, map_height=480):
         st.warning("⚠ No renderable data found. Check your uploaded file or revert to default.")
         return
 
+    # ── Senior-Dev Approach: ColumnLayer for EXACT geographic positioning ──
+    # HexagonLayer aggregates nearby points → smears positions.
+    # ColumnLayer renders one bar per grid cell at its exact lat/lon.
+    # This means bars sit precisely on the measurement location.
+
+    # Build RGBA color per point from the variable's color palette
+    # Map weight (0–100) → color_range index
+    n_colors = len(map_colors)
+    df_spatial = df_spatial.copy()
+    color_idx = (df_spatial["weight"] / 100 * (n_colors - 1)).clip(0, n_colors - 1).astype(int)
+    # Append alpha=200 (semi-transparent) for each color
+    df_spatial["color"] = [list(map_colors[i]) + [200] for i in color_idx]
+
     layer = pdk.Layer(
-        "HexagonLayer",
+        "ColumnLayer",
         data=df_spatial,
         get_position=["lon", "lat"],
-        radius=50000,
-        elevation_scale=1500,
-        get_elevation_weight="weight",
+        get_elevation="weight",          # Bar HEIGHT = normalized data value (0–100)
+        get_fill_color="color",          # Bar COLOR  = mapped via variable palette
+        elevation_scale=2500,            # Physical height multiplier
+        radius=25000,                    # Column radius in meters (~25 km per bar)
+        disk_resolution=6,               # Hexagonal cross-section (6 sides)
         extruded=True,
         pickable=True,
-        color_range=map_colors,
+        auto_highlight=True,
     )
     view_state = pdk.ViewState(
         latitude=20, longitude=0,
@@ -666,7 +681,7 @@ def render_pydeck_map(year_val, map_height=480):
         map_style=pdk.map_styles.CARTO_DARK,
         layers=[layer],
         initial_view_state=view_state,
-        tooltip={"text": f"{climate_var} — Value: {{elevationValue}}"},
+        tooltip={"text": f"{climate_var} — Value: {{value:.2f}} | Weight: {{weight:.0f}}"},
         parameters={"clearColor": [0, 0, 0, 0], "depthTest": True}
     )
     st.pydeck_chart(deck, use_container_width=True, height=map_height)
