@@ -948,8 +948,9 @@ with tab_story:
         """, unsafe_allow_html=True)
 
         if st.button("GENERATE AI CLIMATE REPORT", use_container_width=True):
-            # ── BACKEND HOOK: compute_summary_stats + stream_climate_warning ──
-            ai_stats = backend.compute_summary_stats(climate_var, selected_year, use_uploaded_data=use_uploaded)
+            # ── BACKEND HOOK: compute_summary_stats + stream_story_mode ──
+            _dp = st.session_state.get("active_data_path", "")
+            ai_stats = backend.compute_summary_stats(climate_var, selected_year, use_uploaded_data=use_uploaded, data_path=_dp)
             max_anom = ai_stats["max_value"]
             anomaly_rate = ai_stats["anomaly_rate"]
 
@@ -964,10 +965,10 @@ with tab_story:
 
             # Stream the AI narration character-by-character
             st.write_stream(
-                backend.stream_climate_warning(
-                    target_year=selected_year,
-                    max_anomaly=float(max_anom),
-                    region_name="Global Equatorial Zone",
+                backend.stream_story_mode(
+                    year=selected_year,
+                    variable=climate_var,
+                    stats=ai_stats,
                 )
             )
         else:
