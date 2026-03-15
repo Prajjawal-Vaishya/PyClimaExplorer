@@ -597,8 +597,9 @@ def metric_card(label, value, delta, color_override=None, delta_color=None):
 
 def render_metric_cards(year_val):
     """Render top-row metric cards for a given year."""
-    stats = backend.compute_summary_stats(climate_var, year_val, use_uploaded_data=use_uploaded)
-    stats_prev = backend.compute_summary_stats(climate_var, max(year_val - 10, 1980), use_uploaded_data=use_uploaded)
+    _dp = st.session_state.get("active_data_path", "")
+    stats = backend.compute_summary_stats(climate_var, year_val, use_uploaded_data=use_uploaded, data_path=_dp)
+    stats_prev = backend.compute_summary_stats(climate_var, max(year_val - 10, 1980), use_uploaded_data=use_uploaded, data_path=_dp)
     delta_max = round(stats["max_value"] - stats_prev["max_value"], 2)
     delta_sign = "▲" if delta_max >= 0 else "▼"
 
@@ -638,7 +639,8 @@ def render_metric_cards(year_val):
 def render_pydeck_map(year_val, map_height=480):
     """Render a PyDeck 3D globe for a given year."""
     # ── BACKEND HOOK: get_spatial_dataframe ──
-    df_spatial = backend.get_spatial_dataframe(climate_var, year_val, use_uploaded_data=use_uploaded)
+    _dp = st.session_state.get("active_data_path", "")
+    df_spatial = backend.get_spatial_dataframe(climate_var, year_val, use_uploaded_data=use_uploaded, data_path=_dp)
 
     # Guard: if parser returned empty (corrupted file), show warning and bail
     if df_spatial.empty:
@@ -701,7 +703,7 @@ def render_temporal_chart(highlight_year, chart_height=380):
     years = np.arange(1980, 2051)
     # ── BACKEND HOOK: compute_summary_stats ──
     values = np.array([
-        backend.compute_summary_stats(climate_var, int(yr), use_uploaded_data=use_uploaded)["mean_value"]
+        backend.compute_summary_stats(climate_var, int(yr), use_uploaded_data=use_uploaded, data_path=st.session_state.get("active_data_path", ""))["mean_value"]
         for yr in years
     ])
 
@@ -798,8 +800,40 @@ with tab_main:
     render_legend()
     render_pydeck_map(selected_year, map_height=480)
 
+    # ──────────────────────────────────────────
+    # 🧠 PILLAR 3: AI NARRATIVE (Gemini Storytelling)
+    # ──────────────────────────────────────────
+    st.markdown("<div style='margin-top: 1.5rem; margin-bottom: 0.5rem;' class='section-heading'>AI Narrative & Threat Assessment</div>", unsafe_allow_html=True)
+    
+    col_btn, col_txt = st.columns([1, 4])
+    with col_btn:
+        generate_clicked = st.button("Generate Threat\nAssessment", use_container_width=True)
+    
+    with col_txt:
+        if generate_clicked:
+            with st.spinner("Analyzing spatial telemetry..."):
+                # Get max anomaly to feed to Gemini
+                _dp = st.session_state.get("active_data_path", "")
+                stats = backend.compute_summary_stats(climate_var, selected_year, use_uploaded_data=use_uploaded, data_path=_dp)
+                
+                # Fetch the cinematic warning
+                ai_warning = backend.generate_ai_report(stats['max_value'], target_year=selected_year)
+                
+                # Display in a terminal-style block
+                st.markdown(f"""
+                <div style='background: rgba(255,51,51,0.1); border-left: 4px solid #ff3333; padding: 1rem; border-radius: 4px; font-family: monospace;'>
+                    <span style='color: #ff3333; font-weight: bold;'>[SYSTEM ALERT]</span> {ai_warning}
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div style='background: rgba(255,255,255,0.03); border: 1px dashed rgba(255,255,255,0.2); padding: 1rem; border-radius: 4px; color: #8a99ad; font-family: monospace; text-align: center;'>
+                Awaiting manual trigger for AI narrative synthesis.
+            </div>
+            """, unsafe_allow_html=True)
+
     # Spacer
-    st.markdown("<div style='margin-bottom: 2rem;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='margin-top: 2rem; margin-bottom: 2rem;'></div>", unsafe_allow_html=True)
 
     # Temporal Chart
     st.markdown("<div class='section-heading'>Temporal Analysis</div>", unsafe_allow_html=True)
@@ -848,7 +882,7 @@ with tab_compare:
         render_pydeck_map(year_a, map_height=420)
 
         # Metrics for Year A
-        stats_a = backend.compute_summary_stats(climate_var, year_a, use_uploaded_data=use_uploaded)
+        stats_a = backend.compute_summary_stats(climate_var, year_a, use_uploaded_data=use_uploaded, data_path=st.session_state.get("active_data_path", ""))
         st.markdown(f"""
         <div class='info-glass' style='margin-top: 0.8rem;'>
             <strong>Max:</strong> {stats_a['max_value']:+.2f}{unit} &nbsp;|&nbsp;
@@ -869,7 +903,7 @@ with tab_compare:
         render_pydeck_map(year_b, map_height=420)
 
         # Metrics for Year B
-        stats_b = backend.compute_summary_stats(climate_var, year_b, use_uploaded_data=use_uploaded)
+        stats_b = backend.compute_summary_stats(climate_var, year_b, use_uploaded_data=use_uploaded, data_path=st.session_state.get("active_data_path", ""))
         st.markdown(f"""
         <div class='info-glass' style='margin-top: 0.8rem;'>
             <strong>Max:</strong> {stats_b['max_value']:+.2f}{unit} &nbsp;|&nbsp;
